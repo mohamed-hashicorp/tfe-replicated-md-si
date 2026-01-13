@@ -1,0 +1,67 @@
+#cloud-config
+packages:
+  - git
+  - jq
+  - vim
+  - wget
+  - curl
+  - zip
+  - unzip
+
+write_files:
+  - path: "/tmp/fullchain_pem"
+    permissions: "0600"
+    owner: "root:root"
+    content: |
+      ${bundle_certs}
+
+  - path: "/tmp/private_key_pem"
+    permissions: "0600"
+    owner: "root:root"
+    content: |
+      ${private_key}        
+
+  - path: /tmp/settings.json
+    permissions: 0755
+    owner: root:root
+    content: |
+        {
+            "enc_password": {
+                "value": "${tfe_encryption_password}"
+            },
+            "hairpin_addressing": {
+                "value": "1"
+            },
+            "hostname": {
+                "value": "${tfe_hostname}"
+            },
+            "production_type": {
+                "value": "disk"
+            },
+            "disk_path": {
+                "value": "${disk_path}"
+            }
+        }
+
+  - path: /etc/replicated.conf  
+    permissions: 0755
+    owner: root:root
+    content: |
+        {
+            "DaemonAuthenticationType":          "password",
+            "DaemonAuthenticationPassword":      "${tfe_admin_password}",
+            "TlsBootstrapType":                  "server-path",
+            "TlsBootstrapHostname":              "${tfe_hostname}",
+            "TlsBootstrapCert":                  "/tmp/fullchain_pem",
+            "TlsBootstrapKey":                   "/tmp/private_key_pem",
+            "BypassPreflightChecks":             true,
+            "ImportSettingsFrom":                "/tmp/tfe_settings.json",
+            "LicenseFileLocation":               "/tmp/tfe_license.hclic"
+        }
+
+runcmd:
+  - aws s3 cp s3://${license_bucket}/${license_key} /tmp/tfe_license.hclic --region ${region}
+  - chmod 600 /tmp/tfe_license.hclic
+  - curl -o /tmp/install.sh https://install.terraform.io/ptfe/stable
+  - chmod +x /tmp/install.sh
+  - bash /tmp/install.sh

@@ -1,0 +1,285 @@
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+    acme = {
+      source  = "vancluever/acme"
+      version = "~> 2.0"
+    }
+    tls = {
+      source  = "hashicorp/tls"
+      version = "~> 4.0"
+    }
+  }
+}
+provider "aws" {
+  region = var.region
+}
+
+provider "acme" {
+  server_url = var.acme_server_url
+}
+
+# --- Data Sources to capture the latest Amazon Linnux AMI ---
+data "aws_ami" "amazon_linux" {
+  most_recent = true
+  owners      = ["137112412989"] # Amazon
+
+  filter {
+    name   = "name"
+    values = ["al2023-ami-2023*"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+
+  filter {
+    name   = "root-device-type"
+    values = ["ebs"]
+  }
+
+  filter {
+    name   = "architecture"
+    values = ["x86_64"]
+  }
+}
+
+
+data "aws_vpc" "default" {
+  default = true
+}
+
+data "aws_subnets" "default" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }
+}
+
+locals {
+  subnet_id = data.aws_subnets.default.ids[0]
+}
+
+
+# --- IAM Role for SSM ---
+resource "aws_iam_role" "ssm" {
+  name = "${var.name}-replicated-ssm-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Effect    = "Allow",
+      Principal = { Service = "ec2.amazonaws.com" },
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ssm_core" {
+  role       = aws_iam_role.ssm.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_instance_profile" "ssm" {
+  name = "${var.name}-replicated-instance-profile"
+  role = aws_iam_role.ssm.name
+}
+
+# --- Security Group (HTTP Only) ---
+resource "aws_security_group" "web2" {
+  name        = "${var.name}-replicated-sg"
+  description = "Allow HTTP only"
+  vpc_id      = data.aws_vpc.default.id
+
+  ingress {
+    description = "HTTP"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "SSH"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "Replicated port"
+    from_port   = 8800
+    to_port     = 8800
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# --- EC2 Instance ---
+resource "aws_instance" "this" {
+  ami                         = data.aws_ami.amazon_linux.id
+  instance_type               = var.instance_type
+  subnet_id                   = local.subnet_id
+  vpc_security_group_ids      = [aws_security_group.web2.id]
+  associate_public_ip_address = true
+  iam_instance_profile        = aws_iam_instance_profile.ssm.name
+  key_name                    = null
+
+  root_block_device {
+    volume_size = 100 # in GiB
+    volume_type = "gp3"
+    encrypted   = true # optional but recommended
+  }
+
+  user_data = templatefile("${path.module}/cloud-init.tftpl", {
+    server_cert             = indent(6, acme_certificate.server.certificate_pem)
+    private_key             = indent(6, acme_certificate.server.private_key_pem)
+    bundle_certs            = indent(6, acme_certificate.server.issuer_pem)
+    email                   = var.email
+    tfe_hostname            = var.dns_record
+    tfe_admin_password      = var.tfe_admin_password
+    tfe_encryption_password = var.tfe_encryption_password
+    tfe_image_tag           = var.tfe_image_tag
+    certs_dir               = var.certs_dir
+    data_dir                = var.data_dir
+    disk_path               = var.disk_path
+    region                  = var.region
+    license_bucket = aws_s3_bucket.tfe_assets.id
+    license_key    = aws_s3_object.tfe_license.key
+  })
+   
+  user_data_replace_on_change = true
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    instance_metadata_tags      = "enabled"
+  } 
+  tags = { Name = var.name }
+}
+
+# --- Route53 Hosted Zone ---
+data "aws_route53_zone" "server_zone" {
+  name         = var.hosted_zone_name
+  private_zone = false
+}
+
+# --- Route53 A Record pointing to EC2 public IP ---
+resource "aws_route53_record" "server" {
+  zone_id = data.aws_route53_zone.server_zone.zone_id
+  name    = var.dns_record
+  type    = "A"
+  ttl     = 60
+
+  records = [aws_instance.this.public_ip]
+}
+
+# ACME account private key (used to register with Let's Encrypt)
+resource "tls_private_key" "acme_account" {
+  algorithm = "RSA"
+  rsa_bits  = 4096
+}
+
+# ACME registration (your Let's Encrypt account)
+resource "acme_registration" "this" {
+  account_key_pem = tls_private_key.acme_account.private_key_pem
+  email_address   = var.email
+}
+
+# ACME certificate for your FQDN
+resource "acme_certificate" "server" {
+  account_key_pem = acme_registration.this.account_key_pem
+  common_name     = var.dns_record
+
+  # Default is 30 days – cert will only be renewed when it's close to expiring,
+  # not on every apply. :contentReference[oaicite:1]{index=1}
+  min_days_remaining = 30
+
+  dns_challenge {
+    provider = "route53"
+    config = {
+      AWS_HOSTED_ZONE_ID = data.aws_route53_zone.server_zone.zone_id
+      AWS_REGION         = var.region
+    }
+  }
+}
+
+# Store cert and ket in SSM Parameter Store
+resource "aws_ssm_parameter" "tls_cert" {
+  name  = var.ssm_tls_cert
+  type  = "SecureString"
+  value = acme_certificate.server.certificate_pem
+}
+
+resource "aws_ssm_parameter" "tls_key" {
+  name  = var.ssm_tls_key
+  type  = "SecureString"
+  value = acme_certificate.server.private_key_pem
+}
+
+# IAM Policy to allow EC2 instance to read TLS certs from SSM Parameter Store
+resource "aws_iam_role_policy" "ssm_tls_access" {
+  role = aws_iam_role.ssm.id
+
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect = "Allow",
+        Action = [
+          "ssm:GetParameter",
+          "ssm:GetParameters"
+        ],
+        Resource = [
+          "arn:aws:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter/tls/server/*"
+          
+        ]
+      }
+    ]
+  })
+}
+
+# --- S3 Bucket for TFE license ---
+resource "aws_s3_bucket" "tfe_assets" {
+  bucket_prefix = "${var.name}-tfe-assets-"
+  force_destroy = true 
+}
+
+resource "aws_s3_object" "tfe_license" {
+  bucket = aws_s3_bucket.tfe_assets.id
+  key    = "license.hclic"
+  source = "${path.module}/license.rli" 
+}
+
+# IAM Policy to allow EC2 instance to read TFE license from S3 Bucket
+resource "aws_iam_role_policy" "s3_license_access" {
+  name = "${var.name}-s3-access"
+  role = aws_iam_role.ssm.id
+
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect   = "Allow",
+        Action   = ["s3:GetObject"],
+        Resource = ["${aws_s3_bucket.tfe_assets.arn}/license.hclic"]
+      }
+    ]
+  })
+}
+
+locals {
+  server_fullchain_pem = "${acme_certificate.server.certificate_pem}\n${acme_certificate.server.issuer_pem}"
+}
+
+data "aws_caller_identity" "current" {}
