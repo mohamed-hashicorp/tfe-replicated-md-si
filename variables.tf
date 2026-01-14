@@ -85,3 +85,8 @@ variable "disk_path" {
   type        = string
   default     = "/opt/tfe"
 }
+
+variable "tfe_release_sequence" {
+  description = "TFE release sequence number"
+  type        = string
+}

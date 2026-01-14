@@ -15,13 +15,19 @@ write_files:
     content: |
       ${bundle_certs}
 
+  - path: "/tmp/cert_pem"
+    permissions: "0600"
+    owner: "root:root"
+    content: |
+      ${server_cert}
+
   - path: "/tmp/private_key_pem"
     permissions: "0600"
     owner: "root:root"
     content: |
       ${private_key}        
 
-  - path: /tmp/settings.json
+  - path: /tmp/tfe_settings.json
     permissions: 0755
     owner: root:root
     content: |
@@ -52,16 +58,46 @@ write_files:
             "DaemonAuthenticationPassword":      "${tfe_admin_password}",
             "TlsBootstrapType":                  "server-path",
             "TlsBootstrapHostname":              "${tfe_hostname}",
-            "TlsBootstrapCert":                  "/tmp/fullchain_pem",
+            "TlsBootstrapCert":                  "/tmp/cert_pem",
             "TlsBootstrapKey":                   "/tmp/private_key_pem",
             "BypassPreflightChecks":             true,
             "ImportSettingsFrom":                "/tmp/tfe_settings.json",
             "LicenseFileLocation":               "/tmp/tfe_license.hclic"
         }
 
+  - path: /tmp/tfe-bootstrap.sh
+    permissions: 0755
+    owner: root:root
+    content: |
+        #!/bin/bash
+
+        #--- Fetch EC2 Metadata (IMDSv2) ---
+        TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+        PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
+        PUBLIC_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4)
+
+        # Option if there is no public ip make the public ip the same as private
+        if [ -z "$PUBLIC_IP" ]; then
+            PUBLIC_IP=$PRIVATE_IP
+        fi
+        # --- Terraform Enterprise Installation ---
+        # Download the bash script
+        curl -o /tmp/install.sh https://install.terraform.io/ptfe/stable
+        # Install
+        if [ "${tfe_release_sequence}" ] ; then
+            if [ "$TFE_SEQUENCE" -gt 675  ] ; then
+                echo "Install TFE with version ${tfe_release_sequence} and Docker 24"
+                bash /tmp/install.sh release-sequence=${tfe_release_sequence} no-proxy private-address=$${PRIVATE_IP} public-address=$${PUBLIC_IP}
+            else
+                echo "Install TFE with version ${tfe_release_sequence} and Docker 20.10.17"
+                bash /tmp/install.sh docker-version=20.10.17 release-sequence=${tfe_release_sequence} no-proxy private-address=$${PRIVATE_IP} public-address=$${PUBLIC_IP}
+            fi 
+            else
+            echo "Install latest version TFE with docker version 24"
+            bash /tmp/install.sh no-proxy private-address=$${PRIVATE_IP} public-address=$${PUBLIC_IP}
+        fi      
+
 runcmd:
   - aws s3 cp s3://${license_bucket}/${license_key} /tmp/tfe_license.hclic --region ${region}
   - chmod 600 /tmp/tfe_license.hclic
-  - curl -o /tmp/install.sh https://install.terraform.io/ptfe/stable
-  - chmod +x /tmp/install.sh
-  - bash /tmp/install.sh
+  - bash -x /tmp/tfe-bootstrap.sh

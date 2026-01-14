@@ -157,6 +157,7 @@ resource "aws_instance" "this" {
     region                  = var.region
     license_bucket = aws_s3_bucket.tfe_assets.id
     license_key    = aws_s3_object.tfe_license.key
+    tfe_release_sequence    = var.tfe_release_sequence
   })
    
   user_data_replace_on_change = true
